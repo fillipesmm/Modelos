@@ -1,0 +1,88 @@
+
+library(rpart)
+library(rpart.plot)
+library(ROCR)
+library(randomForest)
+library(neuralnet)
+library(sqldf)
+library(caret)
+library(mlbench)
+library(corrplot)
+library(dplyr)
+library(gmodels)
+
+# Importação dos dados de treino e de teste respectivamente e tratamento final das informações.
+
+Base_Treino<-read.table("C:/Users/204955/Documents/Bases Tabelão/Base_Treino.txt",sep=",",header=T)
+Base_Teste<-read.table("C:/Users/204955/Documents/Bases Tabelão/Base_Teste.txt",sep=",",header=T)
+
+Resposta<-as.matrix(as.double(Base_Treino$Resposta),nrow=1)
+UF_SP<-Base_Treino$EDP_SP
+Circuito<-Base_Treino$Circuito
+
+Treino_Recod<-cbind(Circuito,Resposta,UF_SP,Base_Treino[,499:ncol(Base_Treino)])
+
+Resposta<-as.matrix(as.double(Base_Teste$Resposta),nrow=1)
+UF_SP<-Base_Teste$EDP_SP
+Circuito<-Base_Teste$Circuito
+
+Teste_Recod<-cbind(Circuito,Resposta,UF_SP,Base_Teste[,499:ncol(Base_Teste)])
+
+treino_modelo<-as.data.frame(Treino_Recod)
+teste_modelo<-as.data.frame(Teste_Recod)
+
+#### RFE - Não foi necessário devido ao bom desempenho do modelo 
+
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+results <- rfe(treino_modelo[,3:ncol(treino_modelo)], treino_modelo[,2], sizes=c(1:10), rfeControl=control)
+CP<-predictors(results)[1:50]
+treino_modelo<-cbind(treino_modelo$Circuito,treino_modelo[CP],treino_modelo$Resposta)
+teste_modelo<-cbind(teste_modelo$Circuito,teste_modelo[CP],teste_modelo$Resposta)
+
+colnames(treino_modelo)[1] <- "Circuito"
+colnames(treino_modelo)[ncol(treino_modelo)] <- "Resposta"
+colnames(teste_modelo)[1] <- "Circuito"
+colnames(teste_modelo)[ncol(teste_modelo)] <- "Resposta"
+
+#### Random Forest
+
+RF <- randomForest(Resposta ~ .,data = treino_modelo[,2:ncol(treino_modelo)])
+fitForest_prob <- predict(RF,newdata=teste_modelo)
+fitForest<-as.matrix(round(fitForest_prob),ncol=1)
+varImpPlot(RF,type=2)
+importanceOrder=order(-RF$importance)
+
+##### Indicadores de validação
+
+# 1 - Matriz de confusão
+
+Matriz_de_Confusão<-confusionMatrix(teste_modelo$Resposta,fitForest)
+
+# 2 - Teste KS (Kolmogorov-Smirnov)
+
+decis<-as.vector(quantile(fitForest_prob,prob=c(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9)))
+fitForest_prob<-as.array(fitForest_prob,nrow=ncol(fitForest_prob))
+dados_teste<-as.data.frame(cbind(fitForest,fitForest_prob,0))
+
+for (i in 1:nrow(dados_teste)){
+  if (fitForest_prob[i]<=decis[1]) dados_teste[i,ncol(dados_teste)]<-"A"
+  if (fitForest_prob[i]>decis[1]) dados_teste[i,ncol(dados_teste)]<-"B"
+  if (fitForest_prob[i]>=decis[2]) dados_teste[i,ncol(dados_teste)]<-"C"
+  if (fitForest_prob[i]>=decis[3]) dados_teste[i,ncol(dados_teste)]<-"D"
+  if (fitForest_prob[i]>=decis[4]) dados_teste[i,ncol(dados_teste)]<-"E"
+  if (fitForest_prob[i]>=decis[5]) dados_teste[i,ncol(dados_teste)]<-"F"
+  if (fitForest_prob[i]>=decis[6]) dados_teste[i,ncol(dados_teste)]<-"G"
+  if (fitForest_prob[i]>=decis[7]) dados_teste[i,ncol(dados_teste)]<-"H"
+  if (fitForest_prob[i]>=decis[8]) dados_teste[i,ncol(dados_teste)]<-"I"
+  if (fitForest_prob[i]>=decis[9]) dados_teste[i,ncol(dados_teste)]<-"J"
+}
+
+attach(dados_teste)
+mytable<-table(dados_teste$V3,dados_teste$V1)
+table<-prop.table(mytable, 2)
+ks_RF<-max(abs(table[,1]-table[,2]))
+detach(dados_teste)
+
+
+
+

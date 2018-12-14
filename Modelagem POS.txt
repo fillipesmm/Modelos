@@ -1,0 +1,644 @@
+##########################################
+#                Bibliotecas             #
+##########################################
+from pyspark import SparkConf, SparkContext
+from pyspark.sql import SparkSession,SQLContext
+from pyspark.sql.functions import *
+from pyspark.sql.types import DateType
+from plotly.graph_objs import *
+import pyspark.sql.functions as func
+import matplotlib.pyplot as plt
+import plotly.plotly as py
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
+import random
+import pandas as pd
+import numpy as np
+import requests
+import plotly
+import matplotlib as mpl 
+import statsmodels.api as sm
+import pickle  # Serialization library.
+import os  # General OS-related operations.
+import math
+from __future__ import division
+from xgboost import XGBClassifier
+from sklearn.datasets import make_classification
+from sklearn.cross_validation  import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn import datasets
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from scipy.stats import ks_2samp
+from statsmodels.discrete.discrete_model import Logit
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import AdaBoostClassifier
+
+##########################################
+#     Conexão com HDFS via Spark         #
+##########################################
+
+spark = SparkSession.builder\
+            .appName("POS LR")\
+            .enableHiveSupport()\
+            .config("spark.yarn.executor.memoryOverhead","4G")\
+            .config("spark.executor.memory", "12G")\
+            .config("spark.dynamicAllocation.enabled", "true")\
+            .config("spark.dynamicAllocation.initialExecutors", "5")\
+            .config("spark.dynamicAllocation.maxExecutors","20")\
+            .config("spark.executor.cores", "1")\
+            .config("spark.cores.max", "1")\
+            .config("spark.driver.memory", "4G")\
+            .getOrCreate()
+sqlContext = SQLContext(spark)
+
+##########################################
+#         Regressão Logistica            #
+##########################################
+
+
+# Set random seed for reproducibility.
+random.seed(0)
+np.random.seed(0)
+
+def categorical_serie_to_binary_dataframe(series, nan_code='nan',
+                                          include_nan=False):
+    """Transform a categorical serie into a binary dataframe.
+
+    Arguments:
+        series (pandas.Series): series TODO.
+
+    Returns:
+        pandas.DataFrame: dataframe TODO.
+
+    """
+    df = pd.DataFrame()
+    for i in sorted(series.unique())[:-1]:
+        bool_series = pd.Series(series == i)
+        bool_series.name = series.name + '_' + str(int(i))
+        df = pd.concat((df, bool_series), axis=1)
+    return df
+
+
+def stepwise_selection(X, y,
+                       initial_list=[],
+                       threshold_in=0.01,
+                       threshold_out = 0.05,
+                       verbose=True):
+    """ Perform a forward-backward feature selection
+    based on p-value from statsmodels.api.OLS
+    Arguments:
+        X - pandas.DataFrame with candidate features
+        y - list-like with the target
+        initial_list - list of features to start with (column names of X)
+        threshold_in - include a feature if its p-value < threshold_in
+        threshold_out - exclude a feature if its p-value > threshold_out
+        verbose - whether to print the sequence of inclusions and exclusions
+    Returns: list of selected features
+    Always set threshold_in < threshold_out to avoid infinite looping.
+    See https://en.wikipedia.org/wiki/Stepwise_regression for the details
+    """
+    included = list(initial_list)
+    while True:
+        changed=False
+        # forward step
+        excluded = list(set(X.columns)-set(included))
+        new_pval = pd.Series(index=excluded)
+        for new_column in excluded:
+            print('[excluded] processing', new_column)
+            model = sm.Logit(y, sm.add_constant(pd.DataFrame(X[included+[new_column]]))).fit(disp=False)
+            new_pval[new_column] = model.pvalues[new_column]
+        best_pval = new_pval.min()
+        if best_pval < threshold_in:
+            best_feature = new_pval.idxmin()
+            included.append(best_feature)
+            changed=True
+            if verbose:
+                print('Add  {:30} with p-value {:.6}'.format(best_feature, best_pval))
+
+        # backward step
+        model = sm.Logit(y, sm.add_constant(pd.DataFrame(X[included]))).fit(disp=False)
+        # use all coefs except intercept
+        pvalues = model.pvalues.iloc[1:]
+        worst_pval = pvalues.max() # null if pvalues is empty
+        if worst_pval > threshold_out:
+            changed=True
+            worst_feature = pvalues.idxmax()
+            print('[wost_pval] processing', worst_feature)
+            included.remove(worst_feature)
+            if verbose:
+                print('Drop {:30} with p-value {:.6}'.format(worst_feature, worst_pval))
+        if not changed:
+            break
+    return included
+
+
+# Present in the data_utilities module:
+# https://github.com/fmv1992/data_utilities.
+def ks_2samp_scorer_statsmodels(estimator, x, y, **predict_kwargs):
+    """Return the 2 sample Kolmogorov-Smirnov statistic test statistic.
+
+    Examples:
+        >>> import pandas as pd, numpy as np
+        >>> from sklearn.tree import DecisionTreeClassifier as DTC
+        >>> from sklearn.datasets import load_breast_cancer
+        >>> from sklearn.model_selection import cross_val_score
+        >>> dataset = load_breast_cancer()
+        >>> clf = DTC()
+        >>> score = cross_val_score(clf, dataset.data, dataset.target,
+        ...                         scoring=ks_2samp_scorer)
+        >>> np.mean(score) > 0.7
+        True
+
+    """
+    fit_obj = estimator.fit(disp=False)
+    params = fit_obj.params
+    class0, class1 = np.sort(np.unique(estimator.endog))
+    proba0 = estimator.predict(params, x[y == class0])
+    proba1 = estimator.predict(params, x[y == class1])
+
+    return ks_2samp(proba0, proba1)[0]  # return D only (discard p value).
+
+################################################
+
+# Load training data.
+
+#dados = spark.sql("select * from sand_fraudes.POS_Base_Final_Modelagem")
+#dados.printSchema()
+
+df = spark.sql('''select 
+                      flag_fraude
+                      ,ex_tempo_cliente_m
+                     ,ex_tempo_ult_util_m
+
+                      ,restricao_setor
+                      ,cat_segmento
+                      ,cat_bandeira
+                      ,cat_periodo
+                      ,dia_semana
+                      ,ind_tipo_terminal
+                      ,ind_adquirente
+                      ,cep1
+                      ,cep2
+                      ,cep3
+                      ,cat_peestciv
+                      ,cat_peindno5
+                      ,cat_pesexper
+                      ,flag_ufcpf_ufestab
+                      ,flag_ufag_ufestab
+                      ,cat_mcc
+                      ,cat_tempo_cliente_a
+                      ,cat_tempo_ult_util_m
+                      ,cat_tempo_ult_blq_a
+                      ,cat_hora_transacao
+                      ,uf_trat
+                      ,v_mcc_qt_trx_1m
+                      ,v_mcc_qt_trx_5m
+                      ,v_mcc_qt_trx_10m
+                      ,v_mcc_qt_trx_30m
+                      ,v_mcc_qt_trx_1h
+                      ,v_mcc_qt_trx_2h
+                      ,v_mcc_qt_trx_3h
+                      ,v_mcc_qt_trx_6h
+                      ,v_mcc_qt_trx_12h
+                      ,v_mcc_qt_trx_18h
+                      ,v_mcc_qt_trx_24h
+                      ,v_mcc_qt_trx_48h
+                      ,v_mcc_qt_trx_72h
+                      ,v_mcc_qt_trx_96h
+                      ,v_mcc_vlr_trx_1m
+                      ,v_mcc_vlr_trx_5m
+                      ,v_mcc_vlr_trx_10m
+                      ,v_mcc_vlr_trx_30m
+                      ,v_mcc_vlr_trx_1h
+                      ,v_mcc_vlr_trx_2h
+                      ,v_mcc_vlr_trx_3h
+                      ,v_mcc_vlr_trx_6h
+                      ,v_mcc_vlr_trx_12h
+                      ,v_mcc_vlr_trx_18h
+                      ,v_mcc_vlr_trx_24h
+                      ,v_mcc_vlr_trx_48h
+                      ,v_mcc_vlr_trx_72h
+                      ,v_mcc_vlr_trx_96h
+                      ,v_qt_trx_1m
+                      ,v_qt_trx_5m
+                      ,v_qt_trx_10m
+                      ,v_qt_trx_30m
+                      ,v_qt_trx_1h
+                      ,v_qt_trx_2h
+                      ,v_qt_trx_3h
+                      ,v_qt_trx_6h
+                      ,v_qt_trx_12h
+                      ,v_qt_trx_18h
+                      ,v_qt_trx_24h
+                      ,v_qt_trx_48h
+                      ,v_qt_trx_72h
+                      ,v_qt_trx_96h
+                      ,v_vlr_trx_1m
+                      ,v_vlr_trx_5m
+                      ,v_vlr_trx_10m
+                      ,v_vlr_trx_30m
+                      ,v_vlr_trx_1h
+                      ,v_vlr_trx_2h
+                      ,v_vlr_trx_3h
+                      ,v_vlr_trx_6h
+                      ,v_vlr_trx_12h
+                      ,v_vlr_trx_18h
+                      ,v_vlr_trx_24h
+                      ,v_vlr_trx_48h
+                      ,v_vlr_trx_72h
+                      ,v_vlr_trx_96h
+                      ,fl_maior_q_media_mcc
+                      ,razao_media_mcc
+                from sand_fraudes.POS_Amostra_Refinada_nv_vars                    
+                    ''')
+
+df2 = df.toPandas()
+df2['intercept'] = 1.0
+df2 = df2.apply(lambda x: pd.to_numeric(x, errors='coerce'))
+df2 = df2.dropna(axis=1, how='any')
+
+Y_COLUMN = 'flag_fraude'
+X_COLUMNS = [z for z in df2.columns if 'flag_fraude' not in z] 
+
+y = df2[Y_COLUMN]
+x = df2[X_COLUMNS]
+
+
+# Redimensiona a variável resposta
+y = y.values.reshape(y.shape[0], -1)
+
+# Do the necessary transformations on your data (eg normalization).
+CATEGORIZE_COLUMNS = [ 'ex_tempo_cliente_m'
+    #                  ,'ex_tempo_ult_util_m'
+
+                      ,'restricao_setor'
+                      ,'cat_segmento'
+                      ,'cat_bandeira'
+                      ,'cat_periodo'
+                      ,'dia_semana'
+                      ,'ind_tipo_terminal'
+                      ,'ind_adquirente'
+                      ,'cep1'
+                      ,'cep2'
+                      ,'cep3'
+                      ,'cat_peestciv'
+                      ,'cat_peindno5'
+                      ,'cat_pesexper'
+                      ,'flag_ufcpf_ufestab'
+                      ,'flag_ufag_ufestab'
+                      ,'cat_mcc'
+                      ,'cat_tempo_cliente_a'
+                      ,'cat_tempo_ult_util_m'
+                      ,'cat_tempo_ult_blq_a'
+                      ,'cat_hora_transacao'
+                      ,'uf_trat'
+]
+                      
+df3 = x.copy()
+
+for cat_col in CATEGORIZE_COLUMNS:
+  df3 = pd.concat((df3,
+                   categorical_serie_to_binary_dataframe(df3[cat_col])),
+                   axis=1
+                   # ignore_index=True
+                   )
+  
+  X_NEW_COLUMNS = [x for x in df3.columns if cat_col != x] 
+  df3 = df3[X_NEW_COLUMNS]
+
+x_train = df3.copy()
+y_train = y.copy()
+
+################################################
+#                CONSTRUIR ETAPA TESTE
+################################################
+#                     BASE TETSE
+################################################
+
+
+if not os.path.exists('./02_Fragmentos_Teste/frag_0_POS_teste.pickle'):
+  t1 = sqlContext.table('sand_fraudes.POS_Teste')
+  # Do some data transformations.
+  t2 = t1.drop('pan_trat','identificador_operacion')  # Not suitable for modelling.
+  t3 = t2.fillna(0)
+  t4 = t3.select(*(col(c).cast('float').alias(c) for c in t2.columns))
+  #print('Dataframe data types:', t4.dtypes)
+  SPLITS = [0.001 for _ in range(100)]
+  df_splits = t4.randomSplit(SPLITS, seed=0)
+  dfs = [x.toPandas() for x in df_splits]
+  joined_df = pd.concat(dfs, ignore_index=True)
+  # This portion of the code saves the data as hdf which later can be read with:
+  # new_dastaframe = pd.read_hdf('my_hdf_path')
+  # The advantage is to become independent from the Spark server and load the
+  # data much quicker (hdf read/write is **very** fast).
+  for i, mini_df in enumerate(dfs):
+      print(i)
+    
+      x1 = ['flag_fraude',
+            'ex_tempo_cliente_m',
+            'ex_tempo_ult_util_m',
+            'restricao_setor',
+            'cat_segmento',
+            'cat_bandeira',
+            'cat_periodo',
+            'dia_semana',
+            'ind_tipo_terminal',
+            'ind_adquirente',
+            'cep1',
+            'cep2',
+            'cep3',
+            'cat_peestciv',
+            'cat_peindno5',
+            'cat_pesexper',
+            'flag_ufcpf_ufestab',
+            'flag_ufag_ufestab',
+            'cat_mcc',
+            'cat_tempo_cliente_a',
+            'cat_tempo_ult_util_m',
+            'cat_tempo_ult_blq_a',
+            'cat_hora_transacao',
+            'uf_trat',
+            'v_mcc_qt_trx_1m',
+            'v_mcc_qt_trx_5m',
+            'v_mcc_qt_trx_10m',
+            'v_mcc_qt_trx_30m',
+            'v_mcc_qt_trx_1h',
+            'v_mcc_qt_trx_2h',
+            'v_mcc_qt_trx_3h',
+            'v_mcc_qt_trx_6h',
+            'v_mcc_qt_trx_12h',
+            'v_mcc_qt_trx_18h',
+            'v_mcc_qt_trx_24h',
+            'v_mcc_qt_trx_48h',
+            'v_mcc_qt_trx_72h',
+            'v_mcc_qt_trx_96h',
+            'v_mcc_vlr_trx_1m',
+            'v_mcc_vlr_trx_5m',
+            'v_mcc_vlr_trx_10m',
+            'v_mcc_vlr_trx_30m',
+            'v_mcc_vlr_trx_1h',
+            'v_mcc_vlr_trx_2h',
+            'v_mcc_vlr_trx_3h',
+            'v_mcc_vlr_trx_6h',
+            'v_mcc_vlr_trx_12h',
+            'v_mcc_vlr_trx_18h',
+            'v_mcc_vlr_trx_24h',
+            'v_mcc_vlr_trx_48h',
+            'v_mcc_vlr_trx_72h',
+            'v_mcc_vlr_trx_96h',
+            'v_qt_trx_1m',
+            'v_qt_trx_5m',
+            'v_qt_trx_10m',
+            'v_qt_trx_30m',
+            'v_qt_trx_1h',
+            'v_qt_trx_2h',
+            'v_qt_trx_3h',
+            'v_qt_trx_6h',
+            'v_qt_trx_12h',
+            'v_qt_trx_18h',
+            'v_qt_trx_24h',
+            'v_qt_trx_48h',
+            'v_qt_trx_72h',
+            'v_qt_trx_96h',
+            'v_vlr_trx_1m',
+            'v_vlr_trx_5m',
+            'v_vlr_trx_10m',
+            'v_vlr_trx_30m',
+            'v_vlr_trx_1h',
+            'v_vlr_trx_2h',
+            'v_vlr_trx_3h',
+            'v_vlr_trx_6h',
+            'v_vlr_trx_12h',
+            'v_vlr_trx_18h',
+            'v_vlr_trx_24h',
+            'v_vlr_trx_48h',
+            'v_vlr_trx_72h',
+            'v_vlr_trx_96h',
+            'fl_maior_q_media_mcc',
+            'razao_media_mcc']
+                
+      df_test = mini_df[x1]
+      df_test['intercept'] = 1.0
+  
+      # Do the necessary transformations on your data (eg normalization).
+      CATEGORIZE_COLUMNS = ['ex_tempo_cliente_m'
+                            
+                            ,'restricao_setor'
+                            ,'cat_segmento'
+                            ,'cat_bandeira'
+                            ,'cat_periodo'
+                            ,'dia_semana'
+                            ,'ind_tipo_terminal'
+                            ,'ind_adquirente'
+                            ,'cep1'
+                            ,'cep2'
+                            ,'cep3'
+                            ,'cat_peestciv'
+                            ,'cat_peindno5'
+                            ,'cat_pesexper'
+                            ,'flag_ufcpf_ufestab'
+                            ,'flag_ufag_ufestab'
+                            ,'cat_mcc'
+                            ,'cat_tempo_cliente_a'
+                            ,'cat_tempo_ult_util_m'
+                            ,'cat_tempo_ult_blq_a'
+                            ,'cat_hora_transacao'
+                            ,'uf_trat']
+            
+            
+      df3_test = df_test.copy()
+      
+      for cat_col in CATEGORIZE_COLUMNS:
+        df3_test = pd.concat((df3_test,
+                         categorical_serie_to_binary_dataframe(df3_test[cat_col])),
+                         axis=1
+                         # ignore_index=True
+                         )
+        
+        X_NEW_COLUMNS = [x for x in df3_test.columns if cat_col != x] 
+        df3_test = df3_test[X_NEW_COLUMNS]
+      
+      col_df = df3_test.copy()
+      
+      col_df.to_hdf('./02_Fragmentos_Teste/frag_' + str(i) + '_POS_teste.hdf', key='x')
+   
+dfs = list()
+for hdf_path in filter(lambda x: 'POS_teste.hdf' in x, os.listdir('./02_Fragmentos_Teste/.')):
+  print('loading hdf', hdf_path)
+  hdf_path = './02_Fragmentos_Teste/' + hdf_path
+  dfs.append(pd.read_hdf(hdf_path))
+joined_df = pd.concat(dfs, ignore_index=True)
+
+Y_COLUMN = 'flag_fraude'
+#X_COLUMNS = [z for z in joined_df.columns if 'flag_fraude' not in z] 
+X_COLUMNS = x_train.columns
+
+y_test = joined_df[Y_COLUMN]
+x_test = joined_df[X_COLUMNS]
+
+#Redimensiona a variável resposta
+y_test = y_test.values.reshape(y_test.shape[0], -1)
+
+
+################################################
+#                     MODELAGEM
+################################################
+
+CLF_PATH = 'modelo_LR_.pickle'
+
+MODEL_PATH = './01_Modelos/' + CLF_PATH
+
+if os.path.exists(MODEL_PATH):
+    with open(MODEL_PATH, 'rb') as f:
+        clf = pickle.load(f)
+    fit_obj = clf.fit()
+else: 
+    # Perform stepwise variable selection.
+    columns_stepwise = stepwise_selection(x_train.astype('float'), y_train)
+    print('Columns in regression:', columns_stepwise)
+    
+    xt_train = x_train[columns_stepwise]
+
+    # Instantiate the classifier.
+    # It is strongly advised to use hyper parameter tunning with cross validation
+    # to define the hyper parameters of your model.
+    clf = Logit(y_train, xt_train.astype('float'))
+    
+    # Train the classifier.
+    fit_obj = clf.fit()
+    with open(MODEL_PATH, 'wb') as f:
+        pickle.dump(clf, f)
+
+columns_stepwise = fit_obj.params.index
+
+################################################
+
+xt_train = x_train[columns_stepwise]
+xt_test = x_test[columns_stepwise]
+
+# Correção do Intercepto
+
+tabela = spark.sql("select * from sand_fraudes.POS_base_marcada_final  ")
+
+# Proporção do evento sobre o total
+r_i = (tabela.filter(tabela.flag_fraude==1).count() / tabela.count())
+
+# Proporção do evento sobre a amostra
+y_i = (df.filter(df.flag_fraude==1).count() / df.count())
+
+# Valor do intercepto corrigido
+Intercept = fit_obj.params.intercept - math.log(((1-r_i)/r_i)*(y_i/(1-y_i)))
+
+coef = fit_obj.params.values
+
+var = fit_obj.params.index
+
+# Para a base de treino
+
+Z_train = Intercept
+
+for i in range(0,len(var) - 1):
+  if fit_obj.params.index[i] != 'intercept':
+    Z_train = Z_train + coef[i] * xt_train[var[i]]
+
+Y_train = np.exp(Z_train) / (1 + np.exp(Z_train))
+Y_train = Y_train.values.reshape(Y_train.shape[0], -1)
+
+# Para a base de teste
+
+Z_test = Intercept
+
+for x in range(0,len(var) - 1):
+  if fit_obj.params.index[x] != 'intercept':
+    Z_test = Z_test + coef[x] * xt_test[var[x]]
+
+Y_test = np.exp(Z_test) / (1 + np.exp(Z_test))
+Y_test = Y_test.values.reshape(Y_test.shape[0], -1)
+
+p = np.percentile(Y_train, 97, axis=0)
+d = joined_df[Y_test >= p]
+d.to_csv('base5.csv')
+
+# Metricas (ROC / Gini / KS)
+
+#pred_train = clf.predict(fit_obj.params, xt_train.astype('float'))
+#roc_auc_train = roc_auc_score(y_train, pred_train)
+roc_auc_train = roc_auc_score(y_train, Y_train)
+#roc_auc_test = roc_auc_score(y_test, Y_test)
+print('ROC AUC train: {0:1.2%}.'.format(roc_auc_train))
+#print('ROC AUC test: {0:1.2%}.'.format(roc_auc_test))
+
+gini_train = 2 * roc_auc_train - 1
+#gini_test = 2 * roc_auc_test - 1
+print('Gini train: {0:1.2%}.'.format(gini_train))
+#print('Gini test: {0:1.2%}.'.format(gini_test))
+
+#ks2_sample_train = ks_2samp_scorer_statsmodels(clf, xt_train.astype('float'), y_train)
+ks2_sample_train = ks_2samp(Y_train[y_train == 0], Y_train[y_train == 1])[0]
+#ks2_sample_test = ks_2samp(Y_test[y_test == 0], Y_test[y_test == 1])[0]
+print('KS 2 sample train: {0:1.2%}.'.format(ks2_sample_train))
+#print('KS 2 sample test: {0:1.2%}.'.format(ks2_sample_test))
+
+for i in (10,20,30,40,50,60,70,80,90,100,91,92,93,94,95,96,97,98,99):
+  
+  p = np.percentile(Y_train, i, axis=0)  
+  b_train = Y_train[y_train == 0]
+  f_train = Y_train[y_train == 1]
+# b_test = Y_test[y_test == 0]
+# f_test = Y_test[y_test == 1]  
+  b_test = ''
+  f_test = ''  
+  t_train = Y_train[Y_train < p]
+  t_test = ''  
+  tb_train = b_train[b_train < p]
+  tf_train = f_train[f_train < p]  
+# tb_test = b_test[b_test < p]
+# tf_test = f_test[f_test < p]
+  tb_test = ''
+  tf_test = ''
+  
+ 
+  print(p)
+  print(t_train.shape)
+  print(t_test)
+  print(tb_train.shape)
+  print(tb_test)
+  print(tf_train.shape)
+  print(tf_test)
+
+var = fit_obj.params
+var.to_csv('variaveis.csv')
+Intercept
+
+# Bivariada
+
+# Análise bivariada
+
+df_train = spark.sql("select * from sand_fraudes.POS_base_marcada_final")
+df_test = spark.sql("select * from sand_fraudes.beneficiarios_seg3_pf_final_test_categoria")
+
+COLUMNS = fit_obj.params.index
+X_COLUMNS = [z for z in df.columns if z in str(COLUMNS)] 
+
+# Treino
+
+for i in X_COLUMNS:
+  if 'cat' in i:
+    
+    df_train.crosstab(i,'flag_fraude').show() 
+    print('----------')    
+    
+# Teste
+
+for i in X_COLUMNS:
+  if 'cat' in i:
+    
+    df_test.crosstab(i,'flag_fr').show() 
+    print('----------')
+
+    
+
